@@ -21,6 +21,9 @@
     "second-brain"
   ],
   "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "inject": [
@@ -32,12 +35,14 @@
   "exports": {
     ".": "./lib/index.js",
     "./client": "./dist/client.cjs",
+    "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
     "lib",
     "dist",
     "src",
+    "cordis.patch.yml",
     "README.md",
     "install.ps1"
   ],

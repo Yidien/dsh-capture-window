@@ -28,24 +28,15 @@ dsh-capture/
 
 ## 安装
 
-### 方式一：npm（推荐，免构建）
+### 方式一：一键安装（推荐）
 
 ```powershell
-cd ~/.dsh/profiles/web
-pnpm add dsh-capture-window
+dsh plugin --profile web add dsh-capture-window
 ```
 
-然后在 `~/.dsh/profiles/web/cordis.patch.yml` 末尾追加：
+（`dsh` 即 `npx @deepseek-ai/dsh`。）装完重启 `npx @deepseek-ai/dsh web`，按 `Ctrl+Shift+K` 呼出捕获窗。
 
-```yaml
-- insert:
-    - id: dsh-capture-window
-      name: 'dsh-capture-window'
-```
-
-重启 `npx @deepseek-ai/dsh web`，按 `Ctrl+Shift+K` 呼出捕获窗。
-
-> 注：DSH 目前没有插件商店，npm 装完仍需手动加这段 `cordis.patch.yml`（否则插件不会加载）。
+> 原理：本包声明了 `dsh.bundle.patch`，`dsh plugin add` 会自动把它注册进 `dsh.profile.bundles`，无需手动改 `cordis.patch.yml`。
 
 ### 方式二：源码安装
 
