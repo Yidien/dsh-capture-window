@@ -1,0 +1,68 @@
+{
+  "name": "dsh-capture-window",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "description": "旁路捕获窗 + /recall 引擎:把想法投进一个安静的独立新会话,压缩当前会话最近 10 句作为背景(不进主线上下文、不切主线视图)",
+  "license": "MIT",
+  "author": "yidien",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Yidien/dsh-capture-window.git"
+  },
+  "keywords": [
+    "deepseek",
+    "dsh",
+    "deepseek-harness",
+    "capture",
+    "recall",
+    "cordis-plugin",
+    "note-taking",
+    "second-brain"
+  ],
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./dist/client.cjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "dist",
+    "src",
+    "README.md",
+    "install.ps1"
+  ],
+  "scripts": {
+    "build:host": "tsc -p tsconfig.json",
+    "build:client": "tsdown",
+    "build": "npm run build:host && npm run build:client",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-commands": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-session": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-agent": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-workspace": "^0.1.0-rc.6"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "tsdown": "^0.3.0",
+    "@types/react": "^18.3.1",
+    "@types/node": "^22.0.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}

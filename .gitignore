@@ -1,0 +1,19 @@
+# dependencies
+node_modules/
+
+# build outputs (install.ps1 / npm run build 会重新生成)
+lib/
+dist/
+
+# misc
+.npm-cache/
+*.log
+.DS_Store
+Thumbs.db
+
+# npm lock（本项目用 pnpm，npm 的 lock 是噪声）
+package-lock.json
+
+# editor
+.vscode/
+.idea/
