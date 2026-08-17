@@ -126,7 +126,7 @@ async function summarize(ctx: any, llm: any, segments: string[]): Promise<string
 }
 
 /** 复刻 api-proxy 的 composeAgent setup:装模型选择 + 挂载预设。 */
-function buildSetup(ctx: any, presetId?: string): (agentCtx: any) => Promise<void> {
+function buildSetup(ctx: any, presetId?: string, inheritedModel?: { provider: string; model: string }): (agentCtx: any) => Promise<void> {
   const selSvc = ctx.get('agentDefaultModel');
   const defaults = selSvc && typeof selSvc.currentSelection === 'function' ? selSvc.currentSelection() : undefined;
   return async function setup(agentCtx: any) {
@@ -142,6 +142,7 @@ function buildSetup(ctx: any, presetId?: string): (agentCtx: any) => Promise<voi
           if (logged && logged.config && logged.config.provider && logged.config.model) {
             return { provider: logged.config.provider, model: logged.config.model };
           }
+          if (inheritedModel) return inheritedModel; // 继承当前会话的 model
           return defaults;
         },
         set current(v: any) { picked = v; },
@@ -196,11 +197,31 @@ export async function runRecall(
     const targetId = `recall-${randomUUID()}`;
     const parent = sessions.get(agent.id);
 
+    // 继承当前会话的 preset id(复刻 resolveSessionPreset:agent-preset/selected 事件选定胜,退 header)
+    let parentPresetId: string | undefined = parent && parent.header && parent.header.agentPreset;
+    if (parent && Array.isArray(parent.events)) {
+      for (let i = parent.events.length - 1; i >= 0; i--) {
+        const ev = parent.events[i];
+        if (ev && ev.type === 'agent-preset/selected' && ev.data && ev.data.agentPreset) {
+          parentPresetId = ev.data.agentPreset; break;
+        }
+      }
+    }
+
     let presetId: string | undefined;
     const presets = ctx.get('agentPresets');
     if (presets && typeof presets.resolve === 'function') {
-      try { const r = await presets.resolve(undefined); presetId = r && r.id; } catch { /* ignore */ }
+      try { const r = await presets.resolve(parentPresetId); presetId = r && r.id; } catch { /* ignore */ }
     }
+
+    // 继承当前会话的 model(取 parent requestHeader 的 provider/model,否则退部署默认)
+    let inheritedModel: { provider: string; model: string } | undefined;
+    const parentHeader = parent && typeof parent.requestHeader === 'function' ? parent.requestHeader() : undefined;
+    const headCfg = parentHeader && parentHeader.config;
+    if (headCfg && headCfg.provider && headCfg.model) inheritedModel = { provider: headCfg.provider, model: headCfg.model };
+    const selSvc = ctx.get('agentDefaultModel');
+    const sel = selSvc && typeof selSvc.currentSelection === 'function' ? selSvc.currentSelection() : undefined;
+    const agentOptions = inheritedModel ?? (sel && sel.provider && sel.model ? { provider: sel.provider, model: sel.model } : undefined);
 
     const meta: Record<string, unknown> = {};
     if (agent.id) meta.parentSession = agent.id;
@@ -218,15 +239,11 @@ export async function runRecall(
     if (cwd) meta.cwd = cwd;
     if (presetId) meta.agentPreset = presetId;
 
-    const selSvc = ctx.get('agentDefaultModel');
-    const sel = selSvc && typeof selSvc.currentSelection === 'function' ? selSvc.currentSelection() : undefined;
-    const agentOptions = sel && sel.provider && sel.model ? { provider: sel.provider, model: sel.model } : undefined;
-
     const handle = await agents.create({
       sessionId: targetId,
       agentOptions,
       meta: Object.keys(meta).length ? meta : undefined,
-      setup: buildSetup(ctx, presetId),
+      setup: buildSetup(ctx, presetId, inheritedModel),
     });
     const target = handle && handle.agent ? handle.agent : agents.get(targetId);
     if (!target) return { kind: 'error', text: '创建会话失败' };
