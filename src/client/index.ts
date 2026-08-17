@@ -49,6 +49,32 @@ function injectStyle(css: string): () => void {
   return () => el.remove();
 }
 
+/* ---------------- 窗口坐标持久化(localStorage,重启后回到上次摆放位置) ---------------- */
+
+const POS_KEY = 'dsh-capture:pos';
+const PANEL_W = 380;
+const MARGIN = 8;
+
+/** 读取上次落点,并 clamp 到当前可视区;无记录或读失败则返回 null(用默认位)。 */
+function readSavedPos(): { left: number; top: number } | null {
+  try {
+    const raw = window.localStorage.getItem(POS_KEY);
+    if (!raw) return null;
+    const p = JSON.parse(raw);
+    const left = Number(p && p.left), top = Number(p && p.top);
+    if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
+    const w = window.innerWidth, h = window.innerHeight;
+    // 若上次坐标已跑出当前视口(窗口/分辨率变化),拉回可视区内
+    const cl = Math.max(MARGIN, Math.min(left, w - PANEL_W - MARGIN));
+    const ct = Math.max(MARGIN, Math.min(top, h - 160 - MARGIN));
+    return { left: cl, top: ct };
+  } catch { return null; }
+}
+
+function savePos(pos: { left: number; top: number }): void {
+  try { window.localStorage.setItem(POS_KEY, JSON.stringify(pos)); } catch { /* 忽略 */ }
+}
+
 /* ---------------- markdown 渲染(与 pkg-16 一致) ---------------- */
 
 function splitRow(line: string): string[] {
@@ -429,6 +455,8 @@ export function apply(ctx: any): void {
     const [models, setModels] = React.useState<{ provider: string; providerName: string; model: string; name: string }[]>([]);
     const [currentModel, setCurrentModel] = React.useState<{ provider: string; model: string } | null>(null);
     const [pos, setPos] = React.useState(() => {
+      const saved = readSavedPos();
+      if (saved) return saved;
       const w = typeof window !== 'undefined' ? window.innerWidth : 1200;
       return { left: Math.max(12, w - 380 - 16), top: 140 };
     });
@@ -625,6 +653,11 @@ export function apply(ctx: any): void {
         dragRef.current = null;
         document.removeEventListener('pointermove', move);
         document.removeEventListener('pointerup', up);
+        // 拖动结束落点持久化,下次重启回到此位置
+        setPos((prev) => {
+          savePos(prev);
+          return prev;
+        });
       };
       document.addEventListener('pointermove', move);
       document.addEventListener('pointerup', up);
