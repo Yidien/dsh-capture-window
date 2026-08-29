@@ -18,9 +18,67 @@
  */
 
 import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands';
-import { createUserMessage } from '@deepseek-ai/dsh-llm';
-import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { randomUUID } from 'node:crypto';
+
+/* ---------------- 零 import 官方包（纯外挂收敛） ----------------
+ * 以下两个助手此前直接 import 自 @deepseek-ai/dsh-llm / dsh-agent。
+ * 为消除对官方包名的运行时耦合（升级改名即断加载），改为本地镜像
+ * 官方 0.1.x 的既有实现；行为与引入时完全一致。
+ */
+
+/** 递归冻结（镜像官方 deepFreeze 语义）。 */
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === 'object') {
+    for (const key of Object.keys(value as Record<string, unknown>)) {
+      deepFreeze((value as Record<string, unknown>)[key]);
+    }
+    Object.freeze(value);
+  }
+  return value;
+}
+
+/** 本地 createUserMessage（镜像 dsh-llm：id + role:user + source 透传 + deep-freeze）。 */
+function createUserMessage(input: { content: unknown; source?: unknown }): Record<string, unknown> {
+  return deepFreeze(structuredClone({ ...input, id: randomUUID(), role: 'user' }));
+}
+
+/**
+ * 本地 installModelSelection（镜像 dsh-agent 0.1.x：两个 waterfall 监听器，
+ * 把选中模型注入 system-prompt 变量与后续 agent 请求配置）。
+ * @returns 两个监听器的卸载函数。
+ */
+function installModelSelection(agentCtx: any, selection: any): () => void {
+  const disposeAssembly = agentCtx.on('system-prompt/assemble', async (_assembly: any, _context: any, next: any) => {
+    const selected = selection.current;
+    const assembled = await next();
+    selection.assembled = selected;
+    if (selected === void 0) return assembled;
+    return {
+      ...assembled,
+      variables: {
+        ...assembled.variables,
+        provider: selected.provider,
+        model: selected.model,
+      },
+    };
+  });
+  const disposeRequest = agentCtx.on('agent/request', async (_payload: any, next: any) => {
+    const resolved = await next();
+    const selected = selection.assembled;
+    if (selected === void 0) return resolved;
+    const { reasoningEffort: _inheritedEffort, ...withoutInheritedEffort } = resolved;
+    return {
+      ...withoutInheritedEffort,
+      provider: selected.provider,
+      model: selected.model,
+      ...(selected.reasoningEffort === void 0 ? {} : { reasoningEffort: selected.reasoningEffort }),
+    };
+  });
+  return () => {
+    disposeAssembly();
+    disposeRequest();
+  };
+}
 
 const PLUGIN = 'dsh-capture-window';
 
@@ -301,34 +359,59 @@ export function apply(ctx: any): void {
 
   // 选择模式的「只回对话消息」轻量接口:host 侧直接读 session.events 过滤 user/assistant,
   // 只回 text+seq,避免把整条事件流(含几十万条 assistant/chunk 碎片)下发到浏览器。
-  ctx.inject(['connection'], (connCtx: any) => {
-    const connection = connCtx.connection;
-    if (!connection || typeof connection.rpc?.handle !== 'function') return;
-    connection.rpc.handle('/capture', async (endpoint: string, payload: any) => {
-      if (endpoint !== 'list-messages') {
-        return { ok: false, error: { code: 'bad-request', message: `unknown endpoint ${endpoint}` } };
-      }
-      try {
+  // 通道迁移(dsh 0.1.1-rc.2):旧 connection.rpc.handle 注册接口已被移除,改走
+  // webServer 公开路由(目录内稳定 API,升级不再漂移)。
+  const MESSAGES_ROUTE = '/plugins/capture-window/messages';
+  let messagesRegistered = false;
+  const registerMessagesRoute = () => {
+    if (messagesRegistered) return;
+    const webServer = ctx.get('webServer');
+    if (!webServer || typeof webServer.register !== 'function') return;
+    messagesRegistered = true;
+    ctx.effect(() => webServer.register({
+      kind: 'exact',
+      path: MESSAGES_ROUTE,
+      handler: async (req: any, res: any) => {
+        const url = new URL(req?.url ?? '/', 'http://x');
+        const sessionId = url.searchParams.get('sessionId') ?? '';
+        let status = 200;
+        let body: unknown;
         const sessions = ctx.get('sessions');
-        if (!sessions) return { ok: false, error: { code: 'unavailable', message: 'sessions 服务不可用' } };
-        const sessionId = payload && payload.sessionId;
-        if (typeof sessionId !== 'string' || !sessionId) {
-          return { ok: false, error: { code: 'bad-request', message: '缺少 sessionId' } };
+        if (!sessions) {
+          status = 503;
+          body = { ok: false, error: { code: 'unavailable', message: 'sessions 服务不可用' } };
+        } else if (!sessionId) {
+          status = 400;
+          body = { ok: false, error: { code: 'bad-request', message: '缺少 sessionId' } };
+        } else {
+          try {
+            const events = liveEvents(sessions, sessionId);
+            const msgs: { role: string; text: string; seq: number }[] = [];
+            for (const e of events) {
+              const role = e.type === 'user/message' ? 'user' : e.type === 'assistant/message' ? 'assistant' : '';
+              if (!role) continue;
+              const text = eventText(e);
+              if (!text) continue;
+              msgs.push({ role, text, seq: e.seq });
+            }
+            body = { ok: true, value: msgs };
+          } catch (err: any) {
+            status = 500;
+            body = { ok: false, error: { code: 'internal', message: String(err?.message ?? err) } };
+          }
         }
-        const events = liveEvents(sessions, sessionId);
-        const msgs: { role: string; text: string; seq: number }[] = [];
-        for (const e of events) {
-          const role = e.type === 'user/message' ? 'user' : e.type === 'assistant/message' ? 'assistant' : '';
-          if (!role) continue;
-          const text = eventText(e);
-          if (!text) continue;
-          msgs.push({ role, text, seq: e.seq });
-        }
-        return { ok: true, value: msgs };
-      } catch (err: any) {
-        return { ok: false, error: { code: 'internal', message: String(err?.message ?? err) } };
-      }
-    }, {});
+        const payload = JSON.stringify(body);
+        res.writeHead(status, {
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store',
+        });
+        res.end(payload);
+      },
+    }), 'dsh-capture-window: messages route');
+  };
+  registerMessagesRoute();
+  ctx.on('internal/service', (serviceName: string) => {
+    if (serviceName === 'webServer') registerMessagesRoute();
   });
 }
 

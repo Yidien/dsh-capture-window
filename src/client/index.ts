@@ -201,9 +201,9 @@ function renderMarkdown(text: any): React.ReactNode[] {
 }
 
 const CSS = `
-.cap-fab{position:fixed;right:16px;bottom:16px;z-index:2147483000;display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-button-floating-fill);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;font-weight:600;cursor:pointer;box-shadow:0 8px 24px rgba(0,0,0,.25);pointer-events:auto}
+.cap-fab{position:absolute;right:16px;bottom:16px;z-index:2147483000;display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-button-floating-fill);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;font-weight:600;cursor:pointer;box-shadow:0 8px 24px rgba(0,0,0,.25);pointer-events:auto}
 .cap-fab:hover{background:var(--dsw-alias-button-floating-hover)}
-.cap-panel{position:fixed;width:380px;max-width:calc(100vw - 32px);max-height:calc(100vh - 96px);z-index:2147483000;display:flex;flex-direction:column;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:12px;box-shadow:0 24px 80px rgba(0,0,0,.45);overflow:hidden;color:var(--dsw-alias-label-primary);font-size:13px;line-height:1.5;pointer-events:auto}
+.cap-panel{position:absolute;width:380px;max-width:calc(100vw - 32px);max-height:calc(100vh - 96px);z-index:2147483000;display:flex;flex-direction:column;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:12px;box-shadow:0 24px 80px rgba(0,0,0,.45);overflow:hidden;color:var(--dsw-alias-label-primary);font-size:13px;line-height:1.5;pointer-events:auto}
 .cap-head{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--dsw-alias-border-l1);cursor:grab;user-select:none}
 .cap-head:active{cursor:grabbing}
 .cap-dot{width:8px;height:8px;border-radius:50%;background:var(--dsw-alias-state-business-primary);box-shadow:0 0 8px var(--dsw-alias-state-business-primary);flex:0 0 auto}
@@ -473,23 +473,23 @@ export function apply(ctx: any): void {
 
     const current: string | undefined = props?.useSessions ? props.useSessions((s: any) => s?.current) : undefined;
 
-    // 选择模式:通过 host RPC 拉取对话消息(host 侧已过滤,只回 user/assistant 文本,避免下发 chunk 碎片)
+    // 选择模式:通过 host 的 webServer 路由拉取对话消息(host 侧已过滤,只回 user/assistant 文本,
+    // 避免下发 chunk 碎片;旧 connection.rpc 通道已随 dsh 0.1.1-rc.2 移除)
     React.useEffect(() => {
       if (mode === 'select' && current) {
         let dead = false;
         (async () => {
           try {
-            const rpc = connection?.rpc;
-            if (!rpc || typeof rpc.call !== 'function') { if (!dead) setPickMsgs([]); return; }
-            const res = await rpc.call('/capture', 'list-messages', { sessionId: current });
-            if (!res || res.ok === false) throw new Error(res?.error?.message ?? '拉取失败');
-            const msgs: PickMessage[] = (res.value ?? []).map((m: any) => ({ role: m.role, text: m.text, seq: m.seq }));
+            const res = await fetch(`/plugins/capture-window/messages?sessionId=${encodeURIComponent(current)}`, { cache: 'no-store' });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || data?.ok === false) throw new Error(data?.error?.message ?? `HTTP ${res.status}`);
+            const msgs: PickMessage[] = ((data?.value) ?? []).map((m: any) => ({ role: m.role, text: m.text, seq: m.seq }));
             if (!dead) setPickMsgs(msgs);
           } catch (err) { console.error('[dsh-capture] 选择消息拉取失败', err); if (!dead) setPickMsgs([]); }
         })();
         return () => { dead = true; };
       }
-    }, [mode, current, connection]);
+    }, [mode, current]);
 
     React.useEffect(() => {
       if (mode === 'select' && pickerRef.current) {
@@ -563,7 +563,7 @@ export function apply(ctx: any): void {
           const seqs = picked.map((i) => pickMsgs[i]?.seq).filter((n) => typeof n === 'number');
           line = seqs.length ? `/recall --from ${seqs.join(',')} ${text}` : `/recall --paper ${text}`;
         }
-        const res = await remoteCommands.execute(current, line);
+        const res = await remoteCommands.execute(current, line, []);
         if (!res || res.ok === false) throw new Error(res?.error?.message ?? '命令执行失败');
         if (res.value == null) throw new Error('命令未识别');
         const outcome = res.value.result;
