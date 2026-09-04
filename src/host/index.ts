@@ -121,10 +121,14 @@ function extractRecentTexts(events: any[], max: number): string[] {
   return out;
 }
 
-/** 读 live session.events(getter 实时快照,避开 readSession 的 replay 校验)。 */
+/** 读 live 会话事件(0.1.2 起为 snapshotEvents();旧版兼容 session.events)。 */
 function liveEvents(sessions: any, sessionId: string): any[] {
   const session = sessions ? sessions.get(sessionId) : undefined;
-  return session && Array.isArray(session.events) ? session.events : [];
+  if (!session) return [];
+  if (typeof session.snapshotEvents === 'function') {
+    try { return session.snapshotEvents(); } catch { return []; }
+  }
+  return Array.isArray(session.events) ? session.events : [];
 }
 
 /** 选择:按 seq 读取当前会话的消息文本。 */
@@ -257,12 +261,13 @@ export async function runRecall(
 
     // 继承当前会话的 preset id(复刻 resolveSessionPreset:agent-preset/selected 事件选定胜,退 header)
     let parentPresetId: string | undefined = parent && parent.header && parent.header.agentPreset;
-    if (parent && Array.isArray(parent.events)) {
-      for (let i = parent.events.length - 1; i >= 0; i--) {
-        const ev = parent.events[i];
-        if (ev && ev.type === 'agent-preset/selected' && ev.data && ev.data.agentPreset) {
-          parentPresetId = ev.data.agentPreset; break;
-        }
+    const parentEvents = (parent && typeof parent.snapshotEvents === 'function')
+      ? parent.snapshotEvents()
+      : (parent && Array.isArray(parent.events) ? parent.events : []);
+    for (let i = parentEvents.length - 1; i >= 0; i--) {
+      const ev = parentEvents[i];
+      if (ev && ev.type === 'agent-preset/selected' && ev.data && ev.data.agentPreset) {
+        parentPresetId = ev.data.agentPreset; break;
       }
     }
 

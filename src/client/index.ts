@@ -1,12 +1,12 @@
 /**
  * dsh-capture-window · client 捕获窗 + 对话视图
  *
- * 与动态插件 capt-1/pkg-16 语义对齐。数据层全部走官方 ctx.connection.api(IApiClient):
- *   - 提交想法:api.sessions.prompt('/recall ...') 触发 host 命令
- *   - 读消息:api.sessions.history
- *   - 发消息:api.sessions.prompt({ mode: 'queue' | 'steer' })
- *   - 列模型 / 设模型:api.sessions.models / api.sessions.selectModel
- *   - running / pending:api.events.host / api.events.mux 流
+ * 与动态插件 capt-1/pkg-16 语义对齐。数据层走 0.1.2 的 remote.session 命名空间:
+ *   - 提交想法:ctx.get('remote.commands').execute('/recall ...') 触发 host 命令
+ *   - 读消息:remote.session.follow 快照 + 实时事件流
+ *   - 发消息:remote.session.prompt({ mode: 'queue' | 'steer' })
+ *   - 列模型 / 设模型:remote.session.modelCatalog / remote.session.selectModel
+ *   - running:客户端 sessions store 快照
  *
  * 正式包 client 是真实浏览器 CJS bundle,setTimeout/document/fetch 均可用
  * (不像动态插件 vm 闭包那样遮蔽)。
@@ -14,6 +14,9 @@
 import React from 'react';
 
 const PLUGIN = 'dsh-capture-window';
+
+/** client 端 cordis 服务依赖(0.1.2 起需显式声明,否则 ctx.get 取不到对应服务)。 */
+export const inject = ['sessions', 'slots', 'uiSession', 'remote.session', 'remote.commands'];
 
 const HOTKEY = (e: KeyboardEvent) => e.ctrlKey && e.shiftKey && (e.key === 'K' || e.key === 'k');
 
@@ -40,6 +43,35 @@ function unwrap<T>(res: any): T {
     throw new Error(result.error?.message ?? '请求失败');
   }
   return (result && result.value) as T;
+}
+
+/** 生成 prompt 请求 id(0.1.2 prompt 需 requestId)。 */
+function newRequestId(): string {
+  if (typeof crypto !== 'undefined' && typeof (crypto as any).randomUUID === 'function') return (crypto as any).randomUUID();
+  return 'rq-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+}
+
+/** 单条事件转聊天消息(user/assistant),非消息返回 null。 */
+function eventToMessage(e: any): ChatMessage | null {
+  return eventsToMessages([e])[0] ?? null;
+}
+
+/** 单条事件推进待处理状态(审批/提问)。 */
+function applyPending(prev: 'approval' | 'question' | null, e: any): 'approval' | 'question' | null {
+  if (e?.type === 'approval/asked') return 'approval';
+  if (e?.type === 'approval/decided') return prev === 'approval' ? null : prev;
+  if (e?.type === 'tool/call' && e?.data?.name === 'ask_user_question') return 'question';
+  if (e?.type === 'tool/result') return prev === 'question' ? null : prev;
+  return prev;
+}
+
+/** 从记录流回放待处理状态(0.1.2 审批/提问以会话事件形式出现,不再有 events.mux 流)。 */
+function pendingFromRecords(records: any[]): 'approval' | 'question' | null {
+  let pending: 'approval' | 'question' | null = null;
+  for (const rec of records || []) {
+    pending = applyPending(pending, rec?.event ?? rec);
+  }
+  return pending;
 }
 
 function injectStyle(css: string): () => void {
@@ -335,48 +367,55 @@ function RecentItem(props: {
 export function apply(ctx: any): void {
   const slots = ctx.get('slots');
   if (!slots) return;
-  const connection = ctx.get('connection');
-  const api = connection?.api;
   const sessionsSvc = ctx.get('sessions');
+  // 主界面审批 UI 的权威状态：pendingInteractions，而非会话日志里的审计事件。
+  const uiSession = ctx.get('uiSession');
+  const remoteSession = ctx.get('remote.session');
 
-  // ---- 会话实时状态(running / pending),由 events 流维护 ----
-  interface LiveState { running: boolean; pending: 'approval' | 'question' | null; }
-  const liveState = new Map<string, LiveState>();
-  const liveListeners = new Set<() => void>();
-  const notifyLive = () => { for (const l of Array.from(liveListeners)) l(); };
-  const getLive = (sid: string): LiveState => liveState.get(sid) || { running: false, pending: null };
+  // ---- 会话运行状态:读客户端 sessions store 快照(0.1.2 起无 connection.api.events 流) ----
+  const readRunning = (sid: string): boolean => {
+    try { return !!sessionsSvc?.list?.getSnapshot?.()?.byId?.[sid]?.running; } catch { return false; }
+  };
+  const readCurrent = (): string | undefined => {
+    try { return sessionsSvc?.list?.getSnapshot?.()?.current; } catch { return undefined; }
+  };
 
-  let ac: AbortController | null = null;
-  if (api) {
-    ac = new AbortController();
-    const signal = ac.signal;
-    (async () => {
-      try {
-        for await (const frame of api.events.host({}, signal)) {
-          const f = frame?.payload;
-          if (f?.type === 'host/session-status') {
-            liveState.set(f.sessionId, { ...getLive(f.sessionId), running: f.running });
-            notifyLive();
-          }
-        }
-      } catch { /* stream closed */ }
-    })();
-    (async () => {
-      try {
-        for await (const frame of api.events.mux({}, signal)) {
-          const f = frame?.payload;
-          if (!f) continue;
-          if (f.type === 'approval/requested' || f.type === 'question/requested') {
-            liveState.set(f.sessionId, { ...getLive(f.sessionId), pending: f.type === 'approval/requested' ? 'approval' : 'question' });
-            notifyLive();
-          } else if (f.type === 'approval/resolved' || f.type === 'question/resolved') {
-            liveState.set(f.sessionId, { ...getLive(f.sessionId), pending: null });
-            notifyLive();
-          }
-        }
-      } catch { /* stream closed */ }
-    })();
-    ctx.effect(() => () => { if (ac) ac.abort(); });
+  /** 订阅 sessions store 的 current 选择(0.1.2 不再由 shell.overlay 传 useSessions)。 */
+  function useCurrentSession(): string | undefined {
+    return React.useSyncExternalStore(
+      (cb: () => void) => (sessionsSvc?.list && typeof sessionsSvc.list.subscribe === 'function' ? sessionsSvc.list.subscribe(cb) : () => {}),
+      () => readCurrent(),
+      () => undefined,
+    );
+  }
+
+  /** 与主界面同源地读取某会话的待审批状态；只观察，绝不参与审批 waterfall。 */
+  function readPendingApproval(sessionId: string | null | undefined, interactions: any): 'approval' | null {
+    if (!sessionId) return null;
+    try {
+      const snapshot = interactions?.getSnapshot?.();
+      const values = snapshot && typeof snapshot.values === 'function' ? snapshot.values() : [];
+      for (const interaction of values as Iterable<any>) {
+        if (interaction?.kind === 'approval' && interaction?.sessionId === sessionId) return 'approval';
+      }
+    } catch { /* 缺少 uiSession 时退化为无提示，不影响捕获窗 */ }
+    return null;
+  }
+
+  /**
+   * 显式镜像 uiSession 的 observable 到本插件 React state。
+   * 插件面板是独立 React tree；不用 useSyncExternalStore，避免审批 resolve 通知未驱动该树刷新。
+   */
+  function usePendingApproval(sessionId: string | null | undefined): 'approval' | null {
+    const interactions = uiSession?.pendingInteractions;
+    const [pending, setPending] = React.useState<'approval' | null>(() => readPendingApproval(sessionId, interactions));
+    React.useEffect(() => {
+      const update = () => setPending(readPendingApproval(sessionId, interactions));
+      update();
+      if (!interactions || typeof interactions.subscribe !== 'function') return;
+      return interactions.subscribe(update);
+    }, [sessionId, interactions]);
+    return pending;
   }
 
   // ---- 开合状态 ----
@@ -451,6 +490,7 @@ export function apply(ctx: any): void {
     const [chatMessages, setChatMessages] = React.useState<ChatMessage[]>([]);
     const [chatInput, setChatInput] = React.useState('');
     const [chatBusy, setChatBusy] = React.useState(false);
+    const [chatFollowEpoch, setChatFollowEpoch] = React.useState(0);
     const [chatPending, setChatPending] = React.useState<'approval' | 'question' | null>(null);
     const [models, setModels] = React.useState<{ provider: string; providerName: string; model: string; name: string }[]>([]);
     const [currentModel, setCurrentModel] = React.useState<{ provider: string; model: string } | null>(null);
@@ -471,7 +511,12 @@ export function apply(ctx: any): void {
       stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
     };
 
-    const current: string | undefined = props?.useSessions ? props.useSessions((s: any) => s?.current) : undefined;
+    const current = useCurrentSession();
+    // 与主界面审批卡订阅同一个 uiSession 状态，而不是从 follow 审计日志猜测。
+    const currentPending = usePendingApproval(current);
+    const chatApproval = usePendingApproval(chatSessionId);
+    // 提问仍由会话流推断；审批永远以 uiSession 的 live interaction 为准。
+    const visibleChatPending = chatApproval ?? (chatPending === 'question' ? 'question' : null);
 
     // 选择模式:通过 host 的 webServer 路由拉取对话消息(host 侧已过滤,只回 user/assistant 文本,
     // 避免下发 chunk 碎片;旧 connection.rpc 通道已随 dsh 0.1.1-rc.2 移除)
@@ -505,35 +550,60 @@ export function apply(ctx: any): void {
       }
     }, [chatMessages, chatBusy, chatPending]);
 
-    // chat 视图:轮询 history 读消息 + 读 liveState 的 running/pending
+    /**
+     * follow 的实时帧在断线/会话收束后可能不再送达独立插件树；sessions list
+     * 的 running 转换则是主界面同步维护的生命周期状态。任务从运行变为空闲时，
+     * 重新取得一次 follow 快照，保证最终回复与“思考中”同时刷新。
+     */
     React.useEffect(() => {
-      if (!chatSessionId || !api) return;
+      if (!chatSessionId || !sessionsSvc?.list || typeof sessionsSvc.list.subscribe !== 'function') return;
+      let previous = readRunning(chatSessionId);
+      setChatBusy(previous);
+      return sessionsSvc.list.subscribe(() => {
+        const running = readRunning(chatSessionId);
+        setChatBusy(running);
+        if (previous && !running) setChatFollowEpoch((epoch) => epoch + 1);
+        previous = running;
+      });
+    }, [chatSessionId]);
+
+    // chat 视图:follow 流读消息（首个快照 + 实时事件；任务结束时由 epoch 再拉一次快照）
+    React.useEffect(() => {
+      if (!chatSessionId || !remoteSession || typeof remoteSession.follow !== 'function') return;
       let dead = false;
-      let timer: any = null;
-      const poll = async () => {
-        if (dead) return;
+      const ac = new AbortController();
+      (async () => {
         try {
-          const value = unwrap<any>(await api.sessions.history({ sessionId: chatSessionId, maxMessages: 40 }));
-          const msgs = eventsToMessages(value?.events ?? []);
-          if (!dead) {
-            setChatMessages(msgs.slice(-40));
-            const live = getLive(chatSessionId);
-            setChatBusy(live.running);
-            setChatPending(live.pending);
+          const stream = remoteSession.follow(
+            { address: { kind: 'session', sessionId: chatSessionId }, maxMessages: 60 },
+            ac.signal,
+          );
+          for await (const frame of stream) {
+            if (dead) return;
+            if (frame?.type === 'snapshot') {
+              const msgs = eventsToMessages(frame.records ?? []);
+              setChatMessages(msgs.slice(-40));
+              setChatPending(pendingFromRecords(frame.records ?? []));
+              setChatBusy(readRunning(chatSessionId));
+            } else if (frame?.type === 'event') {
+              const e = frame.event;
+              const msg = eventToMessage(e);
+              if (msg) setChatMessages((m) => m.concat([msg]).slice(-40));
+              setChatPending((p) => applyPending(p, e));
+              setChatBusy(readRunning(chatSessionId));
+            }
           }
-        } catch { /* ignore */ }
-        if (!dead) timer = setTimeout(poll, 700);
-      };
-      poll();
-      return () => { dead = true; if (timer) clearTimeout(timer); };
-    }, [chatSessionId, api]);
+        } catch { /* stream closed */ }
+      })();
+      return () => { dead = true; ac.abort(); };
+    }, [chatSessionId, remoteSession, chatFollowEpoch]);
 
     // chat 视图:列模型
     React.useEffect(() => {
-      if (view === 'chat' && chatSessionId && api) {
+      if (view === 'chat' && chatSessionId && remoteSession && typeof remoteSession.modelCatalog === 'function') {
         (async () => {
           try {
-            const value = unwrap<any>(await api.sessions.models({ sessionId: chatSessionId }));
+            const value = unwrap<any>(await remoteSession.modelCatalog());
             const groups = value?.groups ?? [];
             const flat: { provider: string; providerName: string; model: string; name: string }[] = [];
             for (const g of groups) {
@@ -542,15 +612,16 @@ export function apply(ctx: any): void {
               }
             }
             setModels(flat);
-            if (value?.current) setCurrentModel({ provider: value.current.provider, model: value.current.model });
+            if (value?.default) setCurrentModel({ provider: value.default.provider, model: value.default.model });
           } catch { /* ignore */ }
         })();
       }
-    }, [view, chatSessionId, api]);
+    }, [view, chatSessionId, remoteSession]);
 
     const doPromote = async (text: string, enterChatAfter: boolean) => {
       if (busy) return;
-      if (!current) { setError('没有当前会话，请先选中一个会话'); setStatus(''); return; }
+      const cur = current ?? readCurrent();
+      if (!cur) { setError('没有当前会话，请先选中一个会话'); setStatus(''); return; }
       const remoteCommands = ctx.get('remote.commands');
       if (!remoteCommands || typeof remoteCommands.execute !== 'function') {
         setError('命令服务不可用（remote.commands）'); setStatus(''); return;
@@ -563,7 +634,7 @@ export function apply(ctx: any): void {
           const seqs = picked.map((i) => pickMsgs[i]?.seq).filter((n) => typeof n === 'number');
           line = seqs.length ? `/recall --from ${seqs.join(',')} ${text}` : `/recall --paper ${text}`;
         }
-        const res = await remoteCommands.execute(current, line, []);
+        const res = await remoteCommands.execute(cur, line, []);
         if (!res || res.ok === false) throw new Error(res?.error?.message ?? '命令执行失败');
         if (res.value == null) throw new Error('命令未识别');
         const outcome = res.value.result;
@@ -609,23 +680,23 @@ export function apply(ctx: any): void {
 
     const changeModel = async (e: React.ChangeEvent<HTMLSelectElement>) => {
       const parts = String(e.target.value || '').split('|');
-      if (parts.length < 2 || !chatSessionId || !api) return;
+      if (parts.length < 2 || !chatSessionId || !remoteSession || typeof remoteSession.selectModel !== 'function') return;
       const provider = parts[0];
       const model = parts[1];
       try {
-        const value = unwrap<any>(await api.sessions.selectModel({ sessionId: chatSessionId, provider, model }));
+        const value = unwrap<any>(await remoteSession.selectModel({ sessionId: chatSessionId, provider, model }));
         if (value?.selected) setCurrentModel({ provider: value.selected.provider, model: value.selected.model });
       } catch { /* ignore */ }
     };
 
     const sendChat = async (steer: boolean) => {
       const text = (chatInput || '').trim();
-      if (!text || !chatSessionId || !api) return;
+      if (!text || !chatSessionId || !remoteSession || typeof remoteSession.prompt !== 'function') return;
       setChatInput('');
       setChatMessages((m) => m.concat([{ role: 'user', text }]));
       setChatBusy(true);
       try {
-        await unwrap<any>(await api.sessions.prompt({ sessionId: chatSessionId, mode: steer ? 'steer' : 'queue', content: [{ type: 'text', text }] }));
+        await unwrap<any>(await remoteSession.prompt({ requestId: newRequestId(), sessionId: chatSessionId, mode: steer ? 'steer' : 'queue', content: [{ type: 'text', text }] }));
       } catch (err: any) {
         setChatMessages((m) => m.concat([{ role: 'assistant', text: '⚠ ' + String(err?.message ?? err) }]));
         setChatBusy(false);
@@ -684,8 +755,8 @@ export function apply(ctx: any): void {
 
     const body = view === 'chat'
       ? React.createElement('div', { className: 'cap-body' },
-          chatPending ? React.createElement('div', { className: 'cap-pending' },
-            React.createElement('span', { className: 'cap-pending-text' }, chatPending === 'approval' ? '⏸ 该会话等待审批，请在主界面确认' : '⏸ 该会话在等你回答提问，请在主界面选择'),
+          visibleChatPending ? React.createElement('div', { className: 'cap-pending' },
+            React.createElement('span', { className: 'cap-pending-text' }, visibleChatPending === 'approval' ? '⏸ 该会话等待审批，请在主界面确认' : '⏸ 该会话在等你回答提问，请在主界面选择'),
             React.createElement('button', { className: 'cap-pending-btn', onClick: () => openSession(chatSessionId!) }, '打开会话'),
           ) : null,
           React.createElement('div', { className: 'cap-chat-log', ref: chatLogRef, onScroll: onChatLogScroll },
@@ -697,7 +768,7 @@ export function apply(ctx: any): void {
               const cls = m.role === 'user' ? 'cap-msg cap-msg-user' : 'cap-msg cap-msg-context';
               return React.createElement('div', { key: i, className: cls }, m.role === 'context' ? ('📎 ' + m.text) : m.text);
             }),
-            (chatBusy && !chatPending) ? React.createElement('div', { className: 'cap-msg cap-msg-assistant' }, '思考中…') : null,
+            (chatBusy && !visibleChatPending) ? React.createElement('div', { className: 'cap-msg cap-msg-assistant' }, '思考中…') : null,
           ),
           React.createElement('div', { className: 'cap-composer' },
             React.createElement('textarea', {
@@ -729,6 +800,10 @@ export function apply(ctx: any): void {
           ),
         )
       : React.createElement('div', { className: 'cap-body' },
+          (currentPending && current) ? React.createElement('div', { className: 'cap-pending' },
+            React.createElement('span', { className: 'cap-pending-text' }, currentPending === 'approval' ? '⏸ 当前会话等待审批，请在主界面确认' : '⏸ 当前会话在等你回答提问，请在主界面选择'),
+            React.createElement('button', { className: 'cap-pending-btn', onClick: () => openSession(current) }, '打开会话'),
+          ) : null,
           React.createElement('textarea', {
             className: 'cap-input',
             placeholder: '把想法丢进来…（Enter 开启对话 / Shift+Enter 换行）',

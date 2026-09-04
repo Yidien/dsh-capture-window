@@ -1,6 +1,6 @@
 {
   "name": "dsh-capture-window",
-  "version": "1.0.6",
+  "version": "1.1.3",
   "type": "module",
   "main": "lib/index.js",
   "description": "旁路捕获窗 + /recall 引擎:把想法投进一个安静的独立新会话,压缩当前会话最近 10 句作为背景(不进主线上下文、不切主线视图)",
@@ -53,7 +53,7 @@
   },
   "dependencies": {},
   "devDependencies": {
-    "@deepseek-ai/dsh-commands": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-commands": "^0.1.2-rc.1",
     "typescript": "^5.6.0",
     "tsdown": "^0.3.0",
     "@types/react": "^18.3.1",
