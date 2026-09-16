@@ -188,11 +188,10 @@ async function summarize(ctx: any, llm: any, segments: string[]): Promise<string
 }
 
 /** 复刻 api-proxy 的 composeAgent setup:装模型选择 + 挂载预设。 */
-function buildSetup(ctx: any, presetId?: string, inheritedModel?: { provider: string; model: string }): (agentCtx: any) => Promise<void> {
+function buildSetup(ctx: any, presetId?: string, inheritedModel?: { provider: string; model: string }): (agentCtx: any, agent: any) => Promise<void> {
   const selSvc = ctx.get('agentDefaultModel');
   const defaults = selSvc && typeof selSvc.currentSelection === 'function' ? selSvc.currentSelection() : undefined;
-  return async function setup(agentCtx: any) {
-    const agent = agentCtx && agentCtx.agent;
+  return async function setup(agentCtx: any, agent: any) {
     if (agent) {
       let picked: any;
       const selection = {
